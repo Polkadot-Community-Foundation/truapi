@@ -1,0 +1,115 @@
+name: "PCF: Publish truapi-host (rescoped)"
+
+# Builds @parity/truapi-host the way release.yml does and publishes it as
+# @polkadot-community-foundation/truapi-host through PCF's
+# npm-publish-automation, which holds the npm token and the allowlist.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, e.g. 0.10.1-pcf.1"
+        required: true
+        type: string
+      npm_tag:
+        description: "npm dist-tag to publish under"
+        required: false
+        default: "latest"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pcf-publish-truapi-host
+  cancel-in-progress: false
+
+env:
+  # Toolchains of the upstream release this branch rebuilds.
+  RUST_STABLE: "1.98.0"
+  RUST_NIGHTLY: "nightly-2026-09-02"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          toolchain: ${{ env.RUST_NIGHTLY }}
+          components: rustfmt
+
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version 0.14.0 --locked
+
+      - name: Build truapi-host
+        env:
+          TRUAPI_NIGHTLY_TOOLCHAIN: ${{ env.RUST_NIGHTLY }}
+        run: |
+          set -euo pipefail
+          ./scripts/codegen.sh
+          npm run build --prefix js/packages/truapi-host
+          npm run build:wasm --prefix js/packages/truapi-host
+
+      - name: Require the dotted lite username fix (upstream #602)
+        run: grep -qaF 'isPopIssued(string)' js/packages/truapi-host/dist/wasm/web/truapi_server_bg.wasm
+
+      - name: Pack @polkadot-community-foundation/truapi-host
+        env:
+          PCF_TRUAPI_HOST_VERSION: ${{ inputs.version }}
+        run: node js/packages/truapi-host/scripts/rescope-pack.mjs
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: truapi-host
+          path: artifacts/polkadot-community-foundation-truapi-host-*.tgz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Human gate 1: protected Environment with a required reviewer.
+    environment: npm-publish
+    steps:
+      # Dispatched inline: a private repo's actions cannot be shared across
+      # the org on its current plan.
+      - name: Mint App token (dispatch scope)
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.PUBLISH_APP_ID }}
+          private-key: ${{ secrets.PUBLISH_APP_PRIVATE_KEY }}
+          owner: Polkadot-Community-Foundation
+          repositories: npm-publish-automation
+          permission-actions: write
+
+      - name: Dispatch PCF npm-publish-automation
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          NPM_TAG: ${{ inputs.npm_tag }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg npm_tag "$NPM_TAG" \
+            '{ref: "main", inputs: {repo: $repo, run_id: $run_id, artifact_name: "truapi-host", npm_tag: $npm_tag}}' \
+          | gh api -X POST \
+              /repos/Polkadot-Community-Foundation/npm-publish-automation/actions/workflows/publish.yml/dispatches \
+              --input -
